@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys, os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + '/zongheng_lib')
+
+import g, service, machine, summary, alloc, alloc_proxy
+import optparse, sys
+
+def alloc_proxy_servers(pid, region_pairs, port, need_save):
+    service_list = service.load_service_list()
+    machine_list = machine.load_machine_list()
+
+    results = []
+    alloced_servers = []
+
+    # 对于每个逻辑机房
+    service_diff = []
+    for region, num in region_pairs.iteritems():
+        # 每次分配一个，虽然效率会低点，但是实现简单
+        try:
+            i = 0
+            for i in xrange(num):
+                ir = alloc.generate_ir(service_list, machine_list)
+                server = alloc_proxy.alloc_one_proxy(ir, pid, region, alloced_servers, port)
+                server["machine"] = ir[server["host"]]
+                results.append(server)
+                alloced_servers.append(server)
+                ns = service.new_proxy_service(server["host"], pid, port)
+                service_list.append(ns)
+                service_diff.append(ns)
+        except alloc.NoPortAvaliable:
+            print "ERROR: port not avaliable"
+            sys.exit(1)
+        except alloc.ServerAllocFail:
+            for r in results:
+                print r["host"]
+            print "ERROR: %s=%d server alloc fail, has allocated %d servers" % (region, num, i)
+            sys.exit(1)
+
+    if port is None:
+        port = alloc.alloc_proxy_uni_port(results)
+
+    for s in service_diff:
+        s["port"] = port
+
+    for r in results:
+        r["port"] = port
+
+    # 记录作回滚用
+    if need_save:
+        service.take_service_list(service_diff)
+
+    return results
+
+if __name__ == "__main__":
+    parser = optparse.OptionParser(usage="usage: %prog -d pid bj=20 hz=10 nj=2 nj03=5 gz=10")
+    parser.add_option("-d", "--pid", type="string", help="pid")
+    parser.add_option("-p", "--port", type="int", help="port")
+    parser.add_option("-s", "--save", action="store_true", default=False, help="commit an allocation")
+
+    (options, args) = parser.parse_args()
+
+    pairs = {}
+    for kv in args:
+        m, num = kv.split("=")
+        pairs[m] = int(num)
+
+    if len(pairs.keys()) == 0:
+        print "{bj|hz|nj|nj03|gz}=n [{bj|hz|nj|nj03|gz}=m]... must be provided"
+        sys.exit(1)
+
+    pid = options.pid
+    port = options.port
+    results = alloc_proxy_servers(pid, pairs, port, options.save)
+    for s in results:
+        print s["host"] + ":" + str(s["port"])

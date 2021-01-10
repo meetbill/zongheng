@@ -1,0 +1,233 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys, os
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + '/zongheng_lib')
+
+import g, service, machine, summary, alloc, alloc_redis
+import optparse, sys
+
+def to_mr_map(results):
+    mr_map = {}
+    for r in results:
+        mr = g.machine_room(r["host"])
+        if g.idc(r["host"]) == "bj":
+            count = mr_map.get(mr, 0)
+            mr_map[mr] = count + 1
+    return mr_map
+
+def get_exceed_mrs(mr_map, thresh):
+    ehosts = []
+    for mr, count in mr_map.iteritems():
+        if count >= thresh:
+            ehosts.append(mr)
+    return ehosts
+
+def refresh_info(args):
+    print "refreshing services and machines"
+    for arg in args:
+        xs = arg.split("=")
+        if len(xs) != 2:
+            continue
+        if xs[0] == "s":
+            print " - update service info"
+            service.update_service_list(xs[1])
+        if xs[0] == "m":
+            print " - update machine info"
+            machine.update_machine_list(xs[1])
+    print "done"
+
+def list_commits():
+    logs = service.get_commit_list()
+    for log in logs:
+        print "Commit:\t", str(log["_id"])
+        print "Time:\t", log["time"]
+        print
+        for s in log["services"]:
+            if s.get("dirname") is None:
+                print "***", s, " (broken data, please call jiaoxiang)"
+                continue
+            if s["dirname"].startswith("redis-"):
+                print "  %s %d %s:%d" % (s["dirname"], s["mem_used"], s["host"], s["port"])
+            elif s["dirname"].startswith("redisproxy-"):
+                print "  %s %s:%d" % (s["dirname"], s["host"], s["port"])
+        print
+
+def print_summary(cate):
+    if cate == "all":
+        machine_list = machine.load_machine_list(False)
+        service_list = service.load_service_list()
+        ir = alloc.generate_ir(service_list, machine_list)
+
+        filterby_list = []
+        sortby_list = []
+        for arg in args:
+            if "=" in arg:
+                filterby_list.append(arg.split("="))
+            elif arg in summary.HEADER:
+                sortby_list.append(arg)
+
+        summary.output_summary(ir, sortby_list, filterby_list)
+    elif cate == "service":
+        service.show_services()
+    elif cate == "machine":
+        machines.show_services()
+    else:
+        print "please select all|service|machine"
+
+def print_banlist():
+    machine_list = machine.load_banned_machine_list()
+    for m in machine_list:
+        print m
+
+def drop_commit(dbid):
+    log = service.get_commitlog_by_dbid(dbid)
+    for m in log["services"]:
+        if m["dirname"].startswith("redis-"):
+            machine.update_machine_memory(m["host"], -m["mem_used"])
+    service.drop_commit(dbid)
+
+def alloc_redis_servers(pid, mem, region_pairs, need_save):
+    service_list = service.load_service_list()
+    machine_list = machine.load_machine_list()
+
+    results = []
+    alloced_servers = []
+
+    # 对于每个逻辑机房
+    service_diff = []
+    for region, num in region_pairs.iteritems():
+        # 每次分配一个，虽然效率会低点，但是实现简单
+        try:
+            i = 0
+            for i in xrange(num):
+                mr_map = to_mr_map(results)
+                exclude_mrs = get_exceed_mrs(mr_map, options.single_machine_room_thresh)
+                ir = alloc.generate_ir(service_list, machine_list)
+                try:
+                    server = alloc_redis.alloc_one_redis(ir, pid, mem, region, alloced_servers, exclude_mrs)
+                except:
+                    alloced_servers = []
+                    server = alloc_redis.alloc_one_redis(ir, pid, mem, region, alloced_servers, exclude_mrs)
+                server["machine"] = ir[server["host"]]
+                results.append(server)
+                alloced_servers.append(server)
+                # 将刚刚分配的服务加入缓存，用于下次计算
+                ns = service.new_redis_service(server["host"], server["port"], mem, pid)
+                service_list.append(ns)
+                service_diff.append(ns)
+                # 将刚分配的内存去掉，用于下次计算
+                for m in machine_list:
+                    if m["host"] == server["host"]:
+                        m["mem_used"] += mem
+        except alloc.NoPortAvaliable:
+            print "ERROR: port not avaliable"
+            sys.exit(1)
+        except alloc.ServerAllocFail:
+            for r in results:
+                print r["host"]
+            print "ERROR: %s=%d server alloc fail, has allocated %d servers" % (region, num, i)
+            sys.exit(1)
+
+    # 记录作回滚用
+    if need_save:
+        for m in service_diff:
+            machine.update_machine_memory(m["host"], m["mem_used"])
+        service.take_service_list(service_diff)
+
+    return results
+
+if __name__ == "__main__":
+    optparse.OptionParser.format_epilog = lambda self, formatter: self.epilog
+    parser = optparse.OptionParser(usage="usage: %prog -m <1G> bj=x nj=y hz=z nj03=l gz=m [-v] [-s] [-f] [-d <pid>] [-l]",
+                                   epilog=u"""
+Examples:
+# alloc without save
+redis-server-alloc -m 1G bj=2 nj=2 nj03=4 -t 1 -v
+redis-server-alloc -m 1G bj=2 hz=2 -t 2
+# alloc and save
+redis-server-alloc -m 1G hz=2 nj=2 -s
+# list all commits
+redis-server-alloc -l
+# rollback some commit
+redis-server-alloc -b 53639b8ce46847ba02a09ea7
+# summary
+redis-server-alloc -p all 1G 5G 10G L=tc
+""")
+    parser.add_option("-d", "--pid", type="string", help="pid, if provided, will avoid the servers that have deployed instances of this pid")
+    parser.add_option("-m", "--memory", type="string", help="memory size, eg. 512M 1G")
+    parser.add_option("-t", "--single_machine_room_thresh", type="int", help="max machines per machineroom, only need when bj in args")
+    parser.add_option("-f", "--refresh", action="store_true", default=False, help="froce refresh db, -f s=<service.info> m=<machine.info>")
+    parser.add_option("-s", "--save", action="store_true", default=False, help="commit an allocation")
+    parser.add_option("-l", "--list-commit", action="store_true", help="list commit")
+    parser.add_option("-b", "--drop-commit", type="string", help="drop some commit")
+    parser.add_option("-v", "--verbose", action="store_true", default=False, help="verbose output")
+    parser.add_option("-p", "--print-summary", type="string", help="print summary")
+    parser.add_option("--banlist", action="store_true", default=False, help="show ban machine list")
+    parser.add_option("--ban", help="ban machines, %prog --ban <host>,<host>,...")
+    parser.add_option("--unban", help="unban machines, %prog --unban <host>,<host>,...")
+    (options, args) = parser.parse_args()
+
+    # update
+    if options.refresh:
+        refresh_info(args)
+        sys.exit(0)
+
+    if options.list_commit:
+        list_commits()
+        sys.exit(0)
+
+    if options.ban:
+        hosts = options.ban.split(",")
+        machine.add_banned_machine_list(hosts)
+        sys.exit(0)
+
+    if options.unban:
+        hosts = options.unban.split(",")
+        machine.remove_banned_machine_list(hosts)
+        sys.exit(0)
+
+    # print summary and exit, tmp
+    if options.print_summary is not None:
+        print_summary(options.print_summary)
+        sys.exit(0)
+
+    if options.banlist:
+        print_banlist()
+        sys.exit(0)
+
+    # delete some commit
+    if options.drop_commit:
+        dbid = options.drop_commit
+        drop_commit(dbid)
+        sys.exit(0)
+
+    # alloc
+    pairs = {}
+    for kv in args:
+        m, num = kv.split("=")
+        pairs[m] = int(num)
+
+    if options.memory is None:
+        print "Memory must be provided"
+        sys.exit(1)
+
+    if len(pairs.keys()) == 0:
+        print "{bj|hz|nj|nj03|gz}=n [{bj|hz|nj|nj03|gz}=m]... must be provided"
+        sys.exit(1)
+
+    if "bj" in pairs.keys() and options.single_machine_room_thresh is None:
+        print "max alloc-number in single machine room must be provied for bj, (-t n)"
+        sys.exit(1)
+
+    pid = options.pid
+    mem = g.cap_to_mb(options.memory)
+
+    results = alloc_redis_servers(pid, mem, pairs, options.save)
+    for s in results:
+        print s["host"] + ":" + str(s["port"]),
+        if options.verbose:
+            m = s["machine"]
+            print m["remains"], m["mem_free"], m["mem_total"], m["redis_count"]
+        else:
+            print
